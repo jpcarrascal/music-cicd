@@ -1,0 +1,22 @@
+# Secrets & local config — NEVER commit these
+.env
+*.env
+!.env.example
+
+# OAuth tokens / local state live in ~/.music-cicd, but ignore any local copies too
+tokens.json
+processed.json
+.music-cicd/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
