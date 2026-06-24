@@ -8,6 +8,10 @@ WHAT IT DOES
     1. uploads it to SoundCloud as PRIVATE (never public, not even briefly)
     2. adds it to a playlist you choose
     3. prints the private/secret share link
+  If a previously-uploaded file is later overwritten (e.g. you re-exported
+  the same mix), the new version is uploaded as a new track, swapped into
+  the same playlist slot, and the old track is deleted - SoundCloud has no
+  endpoint to replace a track's audio in place.
 
 COMMANDS
   python music_cicd.py auth        # run ONCE: authorize + store refresh token
@@ -256,9 +260,7 @@ def cmd_playlists():
     print("\nSet SC_PLAYLIST_ID to the ID of the playlist you want.\n")
 
 
-def add_to_playlist(token, playlist_id, track_id):
-    # SoundCloud has no "append one track" endpoint: GET the playlist,
-    # then PUT back the full track list with the new id appended.
+def _get_playlist_track_ids(token, playlist_id):
     g = requests.get(
         f"{API}/playlists/{playlist_id}",
         headers=_auth_header(token),
@@ -266,21 +268,46 @@ def add_to_playlist(token, playlist_id, track_id):
     )
     if not g.ok:
         print(f"  ! Could not read playlist {playlist_id} ({g.status_code}): {g.text}")
-        return False
-    existing = [t["id"] for t in g.json().get("tracks", []) if "id" in t]
-    if track_id in existing:
-        return True
-    new_tracks = [{"id": tid} for tid in existing + [track_id]]
+        return None
+    return [t["id"] for t in g.json().get("tracks", []) if "id" in t]
+
+
+def _put_playlist_track_ids(token, playlist_id, track_ids):
+    # The API rejects a JSON body here ("Could not parse JSON request body")
+    # despite docs suggesting otherwise; it wants classic form-encoded
+    # Rails-style array params instead.
+    form_data = [("playlist[tracks][][id]", str(tid)) for tid in track_ids]
     p = requests.put(
         f"{API}/playlists/{playlist_id}",
-        headers={**_auth_header(token), "Content-Type": "application/json"},
-        data=json.dumps({"playlist": {"tracks": new_tracks}}),
+        headers=_auth_header(token),
+        data=form_data,
         timeout=120,
     )
     if not p.ok:
         print(f"  ! Could not update playlist ({p.status_code}): {p.text}")
         return False
     return True
+
+
+def add_to_playlist(token, playlist_id, track_id):
+    # SoundCloud has no "append one track" endpoint: GET the playlist,
+    # then PUT back the full track list with the new id appended.
+    existing = _get_playlist_track_ids(token, playlist_id)
+    if existing is None:
+        return False
+    if track_id in existing:
+        return True
+    return _put_playlist_track_ids(token, playlist_id, existing + [track_id])
+
+
+def replace_in_playlist(token, playlist_id, old_track_id, new_track_id):
+    existing = _get_playlist_track_ids(token, playlist_id)
+    if existing is None:
+        return False
+    updated = [new_track_id if tid == old_track_id else tid for tid in existing]
+    if old_track_id not in existing:
+        updated.append(new_track_id)  # old track wasn't in there; just add the new one
+    return _put_playlist_track_ids(token, playlist_id, updated)
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +334,18 @@ def upload_track(token, path: Path):
     return resp.json()
 
 
+def delete_track(token, track_id):
+    resp = requests.delete(
+        f"{API}/tracks/{track_id}",
+        headers=_auth_header(token),
+        timeout=60,
+    )
+    if not resp.ok:
+        print(f"  ! Could not delete old track {track_id} ({resp.status_code}): {resp.text}")
+        return False
+    return True
+
+
 def share_link(track):
     permalink = track.get("permalink_url", "")
     secret = track.get("secret_token")
@@ -328,8 +367,24 @@ def cmd_watch():
     poll = int(cfg("SC_POLL_SECONDS", default="5"))
     settle = int(cfg("SC_SETTLE_SECONDS", default="10"))
 
-    processed = set(load_json(SEEN_FILE, []))
-    sizes = {}  # path -> (size, first_seen_at) for settle tracking
+    # path -> {track_id, size, mtime} for files already uploaded at least once
+    processed = load_json(SEEN_FILE, {})
+    if isinstance(processed, list):
+        # upgrading from the old format (a list of paths, no track ids):
+        # snapshot current size/mtime so these are NOT re-uploaded just
+        # because the format changed. track_id is unknown, so if one of
+        # these files is later overwritten it'll be uploaded as a new
+        # track (can't replace what we don't have the id for) rather
+        # than silently re-uploading everything right now.
+        migrated = {}
+        for key in processed:
+            try:
+                st = Path(key).stat()
+                migrated[key] = {"track_id": None, "size": st.st_size, "mtime": st.st_mtime}
+            except OSError:
+                pass
+        processed = migrated
+    settling = {}  # path -> (size, mtime, first_seen_at) for settle tracking
 
     print(f"Watching {watch_dir} for {sorted(exts)}")
     print(f"Playlist: {playlist_id or '(none - just uploading)'}")
@@ -341,40 +396,58 @@ def cmd_watch():
                 if not path.is_file() or path.suffix.lower() not in exts:
                     continue
                 key = str(path.resolve())
-                if key in processed:
-                    continue
                 try:
-                    size = path.stat().st_size
+                    st = path.stat()
                 except OSError:
                     continue
+                size, mtime = st.st_size, st.st_mtime
 
-                prev = sizes.get(key)
-                if prev is None or prev[0] != size:
-                    # changed (or new): (re)start the settle timer
-                    sizes[key] = (size, time.time())
+                done = processed.get(key)
+                if done and done.get("size") == size and done.get("mtime") == mtime:
+                    continue  # already uploaded, unchanged since
+
+                prev = settling.get(key)
+                if prev is None or prev[0] != size or prev[1] != mtime:
+                    # changed (new file, or an overwrite of a processed one):
+                    # (re)start the settle timer
+                    settling[key] = (size, mtime, time.time())
                     continue
-                if time.time() - prev[1] < settle:
+                if time.time() - prev[2] < settle:
                     continue  # still settling
 
                 # stable long enough -> process it
-                print(f"-> {path.name}")
+                is_reupload = bool(done) and done.get("track_id") is not None
+                print(f"-> {path.name}" + (" (re-export, replacing)" if is_reupload else ""))
                 token = get_access_token()
+                # SoundCloud has no "replace audio" endpoint: PUT /tracks/:id
+                # silently ignores a new asset_data on an existing track. The
+                # only way to update a mix is to upload it as a new track and
+                # delete the old one.
                 track = upload_track(token, path)
                 if not track:
-                    # leave it un-processed so you can retry; back off
-                    sizes.pop(key, None)
+                    # leave it un-settled so you can retry; back off
+                    settling.pop(key, None)
                     continue
                 tid = track.get("id")
                 print(f"   uploaded as private (track id {tid})")
                 print(f"   private link: {share_link(track)}")
 
                 if playlist_id:
-                    ok = add_to_playlist(token, playlist_id, tid)
-                    print("   added to playlist" if ok else "   (playlist add failed)")
+                    if is_reupload:
+                        ok = replace_in_playlist(token, playlist_id, done["track_id"], tid)
+                        print("   replaced in playlist" if ok else "   (playlist replace failed)")
+                    else:
+                        ok = add_to_playlist(token, playlist_id, tid)
+                        print("   added to playlist" if ok else "   (playlist add failed)")
 
-                processed.add(key)
-                save_json(SEEN_FILE, sorted(processed))
-                sizes.pop(key, None)
+                if is_reupload:
+                    old_tid = done["track_id"]
+                    if delete_track(token, old_tid):
+                        print(f"   deleted old track {old_tid}")
+
+                processed[key] = {"track_id": tid, "size": size, "mtime": mtime}
+                save_json(SEEN_FILE, processed)
+                settling.pop(key, None)
 
             time.sleep(poll)
         except KeyboardInterrupt:

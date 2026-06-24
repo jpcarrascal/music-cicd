@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template launchd agent for `music_cicd.py watch`.
+
+  Copy this to ~/Library/LaunchAgents/com.music-cicd.watch.plist and replace
+  every /path/to/music-cicd and /path/to/home below with your real paths
+  (absolute paths only - no ~ or $HOME, launchd doesn't expand those).
+  See the "Running as a background service (launchd)" section in README.md.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.music-cicd.watch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/music-cicd/.venv/bin/python</string>
+        <string>-u</string>
+        <string>music_cicd.py</string>
+        <string>watch</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/path/to/music-cicd</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/path/to/home/Library/Logs/music-cicd/watch.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/path/to/home/Library/Logs/music-cicd/watch.err.log</string>
+</dict>
+</plist>
